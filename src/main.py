@@ -39,9 +39,13 @@ def main():
     # Ensure the data directory exists
     os.makedirs('data', exist_ok=True)
     
-    # Create and run the application
-    password_manager = PasswordManager()
-    sys.exit(password_manager.run())
+    try:
+        # Create and run the application
+        password_manager = PasswordManager()
+        sys.exit(password_manager.run())
+    except Exception as e:
+        print(f"Error starting application: {str(e)}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main() 

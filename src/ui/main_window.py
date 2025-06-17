@@ -1,27 +1,44 @@
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLineEdit, QTableWidget, QTableWidgetItem,
-                             QLabel, QComboBox, QMessageBox, QMenu, QAction)
+                             QLabel, QComboBox, QMessageBox, QMenu, QAction, QFileDialog)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt5.QtGui import QIcon, QClipboard
+from PyQt5.QtGui import QIcon, QClipboard, QColor
 from .password_dialog import PasswordDialog
 from .setup_wizard import SetupWizard
 from utils.security import SecurityManager
 from utils.database import DatabaseManager
 from utils.config import ConfigManager
+import pyperclip
+from typing import Optional, Dict, List
 
 class SearchWorker(QThread):
     """Worker thread for performing password searches."""
     finished = pyqtSignal(list)
     
-    def __init__(self, db_manager, query):
+    def __init__(self, db_manager, query: str, category: Optional[str] = None):
         super().__init__()
         self.db_manager = db_manager
         self.query = query
+        self.category = category
+        self._is_running = True
     
     def run(self):
         """Run the search operation."""
-        results = self.db_manager.search_passwords(self.query)
-        self.finished.emit(results)
+        try:
+            if not self._is_running:
+                return
+            results = self.db_manager.search_passwords(self.query, self.category)
+            if self._is_running:  # Check again before emitting
+                self.finished.emit(results)
+        except Exception as e:
+            print(f"Search error: {str(e)}")
+            if self._is_running:
+                self.finished.emit([])
+                
+    def stop(self):
+        """Stop the search operation."""
+        self._is_running = False
+        self.wait()  # Wait for the thread to finish
 
 class MainWindow(QMainWindow):
     def __init__(self, security_manager: SecurityManager, db_manager: DatabaseManager):
@@ -31,7 +48,7 @@ class MainWindow(QMainWindow):
         self.config_manager = ConfigManager()
         
         self.search_worker = None
-        self.search_timer = QTimer()
+        self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self.perform_search)
         
@@ -58,7 +75,8 @@ class MainWindow(QMainWindow):
         # Create category filter
         self.category_filter = QComboBox()
         self.category_filter.addItem('All Categories')
-        self.category_filter.currentTextChanged.connect(self.filter_by_category)
+        self.update_category_filter()
+        self.category_filter.currentTextChanged.connect(self.on_category_changed)
         search_layout.addWidget(self.category_filter)
         
         # Add new password button
@@ -74,9 +92,21 @@ class MainWindow(QMainWindow):
         self.password_table.setHorizontalHeaderLabels(['Title', 'Username', 'Password', 'Category', 'Actions'])
         self.password_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.password_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.password_table.horizontalHeader().setStretchLastSection(True)
-        self.password_table.setAlternatingRowColors(True)  # For better readability
+        self.password_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.password_table.customContextMenuRequested.connect(self.show_context_menu)
         layout.addWidget(self.password_table)
+        
+        # Create buttons
+        button_layout = QHBoxLayout()
+        export_button = QPushButton('Export')
+        export_button.clicked.connect(self.export_passwords)
+        button_layout.addWidget(export_button)
+        
+        import_button = QPushButton('Import')
+        import_button.clicked.connect(self.import_passwords)
+        button_layout.addWidget(import_button)
+        
+        layout.addLayout(button_layout)
         
         # Load initial data
         self.load_passwords()
@@ -110,45 +140,48 @@ class MainWindow(QMainWindow):
         passwords = self.db_manager.search_passwords('')
         self.update_password_table(passwords)
         
-    def update_password_table(self, passwords):
-        """Update the password table with the given passwords."""
+    def update_password_table(self, passwords: Optional[List[Dict]] = None):
+        """Update the password table with search results or all passwords."""
+        if passwords is None:
+            passwords = self.db_manager.search_passwords('')
+            
         self.password_table.setRowCount(len(passwords))
-        
-        for row, pwd in enumerate(passwords):
-            # Title
-            title_item = QTableWidgetItem(pwd['title'])
-            title_item.setData(Qt.UserRole, pwd['id'])  # Store ID for later use
-            self.password_table.setItem(row, 0, title_item)
+        for row, password in enumerate(passwords):
+            # Store password ID and data for later use
+            self.password_table.setItem(row, 0, QTableWidgetItem(password['title']))
+            self.password_table.setItem(row, 1, QTableWidgetItem(password['username']))
             
-            # Username
-            self.password_table.setItem(row, 1, QTableWidgetItem(pwd['username']))
-            
-            # Password (masked)
+            # Create password item with copy button
             password_item = QTableWidgetItem('••••••••')
-            password_item.setData(Qt.UserRole, pwd['password'])  # Store actual password
+            password_item.setData(Qt.UserRole, password['password'])  # Store actual password
             self.password_table.setItem(row, 2, password_item)
             
-            # Category
-            self.password_table.setItem(row, 3, QTableWidgetItem(pwd['category']))
+            self.password_table.setItem(row, 3, QTableWidgetItem(password['category']))
             
-            # Actions
+            # Add action buttons
             actions_widget = QWidget()
             actions_layout = QHBoxLayout(actions_widget)
             actions_layout.setContentsMargins(0, 0, 0, 0)
             
-            copy_btn = QPushButton('Copy')
-            copy_btn.clicked.connect(lambda checked, r=row: self.copy_password(r))
-            actions_layout.addWidget(copy_btn)
+            copy_button = QPushButton('Copy')
+            copy_button.clicked.connect(lambda checked, p=password['password']: self.copy_password(p))
+            actions_layout.addWidget(copy_button)
             
-            edit_btn = QPushButton('Edit')
-            edit_btn.clicked.connect(lambda checked, r=row: self.edit_password(r))
-            actions_layout.addWidget(edit_btn)
+            edit_button = QPushButton('Edit')
+            edit_button.clicked.connect(lambda checked, p=password: self.edit_password(p))
+            actions_layout.addWidget(edit_button)
             
-            delete_btn = QPushButton('Delete')
-            delete_btn.clicked.connect(lambda checked, r=row: self.delete_password(r))
-            actions_layout.addWidget(delete_btn)
+            delete_button = QPushButton('Delete')
+            delete_button.clicked.connect(lambda checked, p=password: self.delete_password(p))
+            actions_layout.addWidget(delete_button)
             
             self.password_table.setCellWidget(row, 4, actions_widget)
+            
+        # Set alternating row colors
+        for row in range(self.password_table.rowCount()):
+            if row % 2 == 0:
+                for col in range(self.password_table.columnCount()):
+                    self.password_table.item(row, col).setBackground(QColor(240, 240, 240))
         
         self.password_table.resizeColumnsToContents()
         
@@ -166,19 +199,21 @@ class MainWindow(QMainWindow):
         
     def on_search_text_changed(self):
         """Handle search text changes with debouncing."""
-        self.search_timer.start(300)  # Wait 300ms before searching
+        self.search_timer.start(300)  # 300ms delay
         
     def perform_search(self):
         """Perform the actual search operation."""
-        query = self.search_input.text()
-        
-        # Cancel any existing search
+        # Stop any existing search
         if self.search_worker and self.search_worker.isRunning():
-            self.search_worker.terminate()
-            self.search_worker.wait()
-        
-        # Create and start new search worker
-        self.search_worker = SearchWorker(self.db_manager, query)
+            self.search_worker.stop()
+            
+        query = self.search_input.text()
+        category = self.category_filter.currentText()
+        if category == 'All Categories':
+            category = None
+            
+        # Create and start search worker
+        self.search_worker = SearchWorker(self.db_manager, query, category)
         self.search_worker.finished.connect(self.update_password_table)
         self.search_worker.start()
         
@@ -197,41 +232,30 @@ class MainWindow(QMainWindow):
             self.load_passwords()
             self.update_categories()
         
-    def edit_password(self, row):
-        """Show dialog to edit a password."""
-        password_id = self.password_table.item(row, 0).data(Qt.UserRole)
-        dialog = PasswordDialog(self, password_id)
+    def edit_password(self, password_data: Dict):
+        """Show dialog to edit an existing password."""
+        dialog = PasswordDialog(self, password_data)
         if dialog.exec_() == 1:
             self.load_passwords()
             self.update_categories()
         
-    def delete_password(self, row):
+    def delete_password(self, password_data: Dict):
         """Delete a password after confirmation."""
-        password_id = self.password_table.item(row, 0).data(Qt.UserRole)
-        title = self.password_table.item(row, 0).text()
-        
         reply = QMessageBox.question(
-            self, 'Confirm Deletion',
-            f'Are you sure you want to delete the password for "{title}"?',
+            self, 'Confirm Delete',
+            f"Are you sure you want to delete the password for {password_data['title']}?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
-            self.db_manager.delete_password(password_id)
+            self.db_manager.delete_password(password_data['id'])
             self.load_passwords()
             self.update_categories()
         
-    def copy_password(self, row):
-        """Copy password to clipboard."""
-        password = self.password_table.item(row, 2).data(Qt.UserRole)
-        clipboard = QApplication.clipboard()
-        clipboard.setText(password)
-        
-        # Clear clipboard after timeout
-        QTimer.singleShot(
-            self.config_manager.get_clipboard_timeout() * 1000,
-            lambda: clipboard.clear()
-        )
+    def copy_password(self, password: str):
+        """Copy password to clipboard with timeout."""
+        pyperclip.copy(password)
+        QMessageBox.information(self, 'Success', 'Password copied to clipboard!')
         
     def closeEvent(self, event):
         """Handle application close event."""
@@ -244,8 +268,77 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             # Clean up resources
             if self.search_worker and self.search_worker.isRunning():
-                self.search_worker.terminate()
-                self.search_worker.wait()
+                self.search_worker.stop()
             event.accept()
         else:
-            event.ignore() 
+            event.ignore()
+        
+    def update_category_filter(self):
+        """Update the category filter dropdown."""
+        current = self.category_filter.currentText()
+        self.category_filter.clear()
+        self.category_filter.addItem('All Categories')
+        categories = self.db_manager.get_all_categories()
+        self.category_filter.addItems(categories)
+        if current in categories:
+            self.category_filter.setCurrentText(current)
+            
+    def on_category_changed(self):
+        """Handle category filter changes."""
+        self.perform_search()
+        
+    def show_context_menu(self, position):
+        """Show context menu for password table."""
+        menu = QMenu()
+        copy_action = QAction('Copy Password', self)
+        edit_action = QAction('Edit', self)
+        delete_action = QAction('Delete', self)
+        
+        menu.addAction(copy_action)
+        menu.addAction(edit_action)
+        menu.addAction(delete_action)
+        
+        action = menu.exec_(self.password_table.mapToGlobal(position))
+        if action:
+            row = self.password_table.rowAt(position.y())
+            if row >= 0:
+                password_data = {
+                    'id': row,
+                    'title': self.password_table.item(row, 0).text(),
+                    'username': self.password_table.item(row, 1).text(),
+                    'password': self.password_table.item(row, 2).data(Qt.UserRole),
+                    'category': self.password_table.item(row, 3).text()
+                }
+                
+                if action == copy_action:
+                    self.copy_password(password_data['password'])
+                elif action == edit_action:
+                    self.edit_password(password_data)
+                elif action == delete_action:
+                    self.delete_password(password_data)
+                    
+    def export_passwords(self):
+        """Export passwords to a file."""
+        try:
+            file_path = QFileDialog.getSaveFileName(
+                self, 'Export Passwords', '', 'JSON Files (*.json)'
+            )[0]
+            if file_path:
+                self.db_manager.export_passwords(file_path)
+                QMessageBox.information(self, 'Success', 'Passwords exported successfully!')
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', f'Failed to export passwords: {str(e)}')
+            
+    def import_passwords(self):
+        """Import passwords from a file."""
+        try:
+            file_path = QFileDialog.getOpenFileName(
+                self, 'Import Passwords', '', 'JSON Files (*.json)'
+            )[0]
+            if file_path:
+                self.db_manager.import_passwords(file_path)
+                self.update_password_table()
+                self.update_categories()
+                QMessageBox.information(self, 'Success', 'Passwords imported successfully!')
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', f'Failed to import passwords: {str(e)}') 

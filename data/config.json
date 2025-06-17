@@ -1,0 +1,17 @@
+{
+  "is_configured": false,
+  "auto_lock_timeout": 300,
+  "clipboard_timeout": 30,
+  "theme": "light",
+  "password_generator": {
+    "length": 16,
+    "use_uppercase": true,
+    "use_lowercase": true,
+    "use_numbers": true,
+    "use_special": true
+  },
+  "security": {
+    "hash_algorithm": "argon2id",
+    "encryption_algorithm": "aes-256-gcm"
+  }
+}
