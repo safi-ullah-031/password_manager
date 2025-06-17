@@ -1,0 +1,5 @@
+# Requirements.txt Module
+
+PyQt5==5.15.9
+cryptography==41.0.1
+argon2-cffi==21.3.0
