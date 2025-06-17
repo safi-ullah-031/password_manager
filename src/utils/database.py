@@ -2,18 +2,43 @@ import sqlite3
 import json
 from datetime import datetime
 from typing import List, Dict, Optional
+from contextlib import contextmanager
 
 class DatabaseManager:
     def __init__(self):
         self.db_path = 'data/passwords.db'
         self._init_db()
+        self._connection = None
+    
+    @contextmanager
+    def get_connection(self):
+        """Get a database connection with optimized settings."""
+        if not self._connection:
+            self._connection = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=30
+            )
+            # Enable foreign keys and optimize for performance
+            self._connection.execute('PRAGMA foreign_keys = ON')
+            self._connection.execute('PRAGMA journal_mode = WAL')
+            self._connection.execute('PRAGMA synchronous = NORMAL')
+            self._connection.execute('PRAGMA cache_size = -2000')  # Use 2MB of cache
+            self._connection.execute('PRAGMA temp_store = MEMORY')
+        try:
+            yield self._connection
+        except Exception:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
     
     def _init_db(self):
-        """Initialize the database with required tables."""
-        with sqlite3.connect(self.db_path) as conn:
+        """Initialize the database with optimized schema."""
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Create passwords table
+            # Create passwords table with optimized indexes
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS passwords (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,7 +53,12 @@ class DatabaseManager:
                 )
             ''')
             
-            # Create categories table
+            # Create indexes for faster searches
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_passwords_title ON passwords(title)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_passwords_username ON passwords(username)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_passwords_category ON passwords(category)')
+            
+            # Create categories table with unique constraint
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS categories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,25 +66,22 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
-            conn.commit()
     
     def add_password(self, title: str, username: str, password: str,
                     url: Optional[str] = None, notes: Optional[str] = None,
                     category: str = 'Uncategorized') -> int:
         """Add a new password entry to the database."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO passwords (title, username, password, url, notes, category)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (title, username, password, url, notes, category))
-            conn.commit()
             return cursor.lastrowid
     
     def get_password(self, password_id: int) -> Dict:
         """Retrieve a password entry by ID."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, title, username, password, url, notes, created_at, updated_at, category
@@ -91,29 +118,28 @@ class DatabaseManager:
             WHERE id = ?
         '''
         
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, list(update_fields.values()) + [password_id])
-            conn.commit()
             return cursor.rowcount > 0
     
     def delete_password(self, password_id: int) -> bool:
         """Delete a password entry."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('DELETE FROM passwords WHERE id = ?', (password_id,))
-            conn.commit()
             return cursor.rowcount > 0
     
     def search_passwords(self, query: str) -> List[Dict]:
         """Search passwords by title, username, or notes."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, title, username, password, url, notes, created_at, updated_at, category
                 FROM passwords
                 WHERE title LIKE ? OR username LIKE ? OR notes LIKE ?
                 ORDER BY title
+                LIMIT 100
             ''', (f'%{query}%', f'%{query}%', f'%{query}%'))
             
             return [{
@@ -130,14 +156,14 @@ class DatabaseManager:
     
     def get_all_categories(self) -> List[str]:
         """Get all password categories."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT DISTINCT category FROM passwords ORDER BY category')
             return [row[0] for row in cursor.fetchall()]
     
     def export_passwords(self, filepath: str):
         """Export all passwords to a JSON file."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM passwords')
             passwords = [{
@@ -160,12 +186,16 @@ class DatabaseManager:
         with open(filepath, 'r') as f:
             passwords = json.load(f)
             
-        with sqlite3.connect(self.db_path) as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
-            for pwd in passwords:
-                cursor.execute('''
-                    INSERT INTO passwords (title, username, password, url, notes, category)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (pwd['title'], pwd['username'], pwd['password'],
-                     pwd.get('url'), pwd.get('notes'), pwd.get('category', 'Uncategorized')))
-            conn.commit() 
+            cursor.executemany('''
+                INSERT INTO passwords (title, username, password, url, notes, category)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', [(pwd['title'], pwd['username'], pwd['password'],
+                  pwd.get('url'), pwd.get('notes'), pwd.get('category', 'Uncategorized'))
+                 for pwd in passwords])
+    
+    def __del__(self):
+        """Clean up database connection."""
+        if self._connection:
+            self._connection.close() 

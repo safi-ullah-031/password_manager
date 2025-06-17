@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLineEdit, QTableWidget, QTableWidgetItem,
                              QLabel, QComboBox, QMessageBox, QMenu, QAction)
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QClipboard
 from .password_dialog import PasswordDialog
 from .setup_wizard import SetupWizard
@@ -9,12 +9,31 @@ from utils.security import SecurityManager
 from utils.database import DatabaseManager
 from utils.config import ConfigManager
 
+class SearchWorker(QThread):
+    """Worker thread for performing password searches."""
+    finished = pyqtSignal(list)
+    
+    def __init__(self, db_manager, query):
+        super().__init__()
+        self.db_manager = db_manager
+        self.query = query
+    
+    def run(self):
+        """Run the search operation."""
+        results = self.db_manager.search_passwords(self.query)
+        self.finished.emit(results)
+
 class MainWindow(QMainWindow):
     def __init__(self, security_manager: SecurityManager, db_manager: DatabaseManager):
         super().__init__()
         self.security_manager = security_manager
         self.db_manager = db_manager
         self.config_manager = ConfigManager()
+        
+        self.search_worker = None
+        self.search_timer = QTimer()
+        self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(self.perform_search)
         
         self.init_ui()
         self.setup_auto_lock()
@@ -33,7 +52,7 @@ class MainWindow(QMainWindow):
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText('Search passwords...')
-        self.search_input.textChanged.connect(self.search_passwords)
+        self.search_input.textChanged.connect(self.on_search_text_changed)
         search_layout.addWidget(self.search_input)
         
         # Create category filter
@@ -56,6 +75,7 @@ class MainWindow(QMainWindow):
         self.password_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.password_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.password_table.horizontalHeader().setStretchLastSection(True)
+        self.password_table.setAlternatingRowColors(True)  # For better readability
         layout.addWidget(self.password_table)
         
         # Load initial data
@@ -96,7 +116,9 @@ class MainWindow(QMainWindow):
         
         for row, pwd in enumerate(passwords):
             # Title
-            self.password_table.setItem(row, 0, QTableWidgetItem(pwd['title']))
+            title_item = QTableWidgetItem(pwd['title'])
+            title_item.setData(Qt.UserRole, pwd['id'])  # Store ID for later use
+            self.password_table.setItem(row, 0, title_item)
             
             # Username
             self.password_table.setItem(row, 1, QTableWidgetItem(pwd['username']))
@@ -142,11 +164,23 @@ class MainWindow(QMainWindow):
         if current_category in categories:
             self.category_filter.setCurrentText(current_category)
         
-    def search_passwords(self):
-        """Search passwords based on the search input."""
+    def on_search_text_changed(self):
+        """Handle search text changes with debouncing."""
+        self.search_timer.start(300)  # Wait 300ms before searching
+        
+    def perform_search(self):
+        """Perform the actual search operation."""
         query = self.search_input.text()
-        passwords = self.db_manager.search_passwords(query)
-        self.update_password_table(passwords)
+        
+        # Cancel any existing search
+        if self.search_worker and self.search_worker.isRunning():
+            self.search_worker.terminate()
+            self.search_worker.wait()
+        
+        # Create and start new search worker
+        self.search_worker = SearchWorker(self.db_manager, query)
+        self.search_worker.finished.connect(self.update_password_table)
+        self.search_worker.start()
         
     def filter_by_category(self, category):
         """Filter passwords by category."""
@@ -160,7 +194,6 @@ class MainWindow(QMainWindow):
         """Show dialog to add a new password."""
         dialog = PasswordDialog(self)
         if dialog.exec_() == 1:
-            # TODO: Add password to database
             self.load_passwords()
             self.update_categories()
         
@@ -169,7 +202,6 @@ class MainWindow(QMainWindow):
         password_id = self.password_table.item(row, 0).data(Qt.UserRole)
         dialog = PasswordDialog(self, password_id)
         if dialog.exec_() == 1:
-            # TODO: Update password in database
             self.load_passwords()
             self.update_categories()
         
@@ -185,7 +217,7 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.Yes:
-            # TODO: Delete password from database
+            self.db_manager.delete_password(password_id)
             self.load_passwords()
             self.update_categories()
         
@@ -210,6 +242,10 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.Yes:
+            # Clean up resources
+            if self.search_worker and self.search_worker.isRunning():
+                self.search_worker.terminate()
+                self.search_worker.wait()
             event.accept()
         else:
             event.ignore() 
